@@ -1,0 +1,70 @@
+{
+  "name": "@xmanrui/dsh-dingtalk",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness DingTalk channel plugin with QR-code bot authorization",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xmanrui/dsh-dingtalk.git"
+  },
+  "homepage": "https://github.com/xmanrui/dsh-dingtalk#readme",
+  "bugs": "https://github.com/xmanrui/dsh-dingtalk/issues",
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "dsh-dingtalk": "./bin/dsh-dingtalk.mjs"
+  },
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./client-source": "./plugin-src/client/index.js",
+    "./client-api": "./plugin-src/client/api.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "cordis.patch.yml",
+    "lib",
+    "plugin-src",
+    "scripts",
+    "src",
+    "LICENSE",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ],
+      "platform": "web"
+    }
+  },
+  "scripts": {
+    "build": "node plugin-src/client/build.mjs && node plugin-src/host/build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm test && npm run build && node scripts/verify-package.mjs",
+    "verify:protocol": "node scripts/verify-protocol.mjs"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "dependencies": {
+    "dingtalk-stream": "2.1.4",
+    "qrcode": "1.5.4"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.9",
+    "react": "18.3.1"
+  }
+}

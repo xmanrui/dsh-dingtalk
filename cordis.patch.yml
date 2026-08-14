@@ -1,0 +1,3 @@
+- insert:
+    - id: xmanrui-dsh-dingtalk
+      name: '@xmanrui/dsh-dingtalk'
