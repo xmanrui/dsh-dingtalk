@@ -29,9 +29,29 @@ function streamIsOpen(client) {
   return socketOpen && registrationReady;
 }
 
-async function waitForStreamOpen(client, timeoutMs, pollIntervalMs, signal) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+function abortable(promise, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function waitForStreamOpen(client, pollIntervalMs, signal) {
+  while (true) {
     signal?.throwIfAborted();
     if (streamIsOpen(client)) return;
     await new Promise((resolve, reject) => {
@@ -46,7 +66,28 @@ async function waitForStreamOpen(client, timeoutMs, pollIntervalMs, signal) {
       signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
-  throw new Error(`DingTalk Stream handshake timed out after ${timeoutMs}ms`);
+}
+
+async function connectStream(client, timeoutMs, pollIntervalMs, signal) {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const connectSignal = AbortSignal.any([signal, timeoutSignal]);
+  let connectSettled = false;
+  const connectTask = Promise.resolve()
+    .then(() => client.connect())
+    .finally(() => { connectSettled = true; });
+  try {
+    await abortable(connectTask, connectSignal);
+    await waitForStreamOpen(client, pollIntervalMs, connectSignal);
+  } catch (error) {
+    if (connectSignal.aborted) {
+      if (!connectSettled) {
+        void connectTask.then(() => client.disconnect()).catch(() => undefined);
+      }
+      if (signal.aborted) throw signal.reason;
+      throw new Error(`DingTalk Stream handshake timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  }
 }
 
 async function defaultStreamFactory({ clientId, clientSecret }) {
@@ -250,8 +291,7 @@ export class DingtalkRuntime {
         this.#callbackTasks.add(task);
       });
 
-      await client.connect();
-      await waitForStreamOpen(
+      await connectStream(
         client,
         this.#connectTimeoutMs,
         this.#connectPollIntervalMs,

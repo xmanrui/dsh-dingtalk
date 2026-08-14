@@ -487,6 +487,7 @@ export class DingtalkController {
     if (this.#closed) return;
     this.#closed = true;
     if (this.#activeAttemptId) await this.cancelProvisioning(this.#activeAttemptId);
+    await Promise.allSettled([...this.#runtimes.keys()].map((botId) => this.#stopRuntime(botId)));
     await Promise.allSettled([...this.#transitions.values()]);
     await Promise.allSettled([...this.#runtimes.keys()].map((botId) => this.#stopRuntime(botId)));
   }
@@ -619,14 +620,19 @@ export class DingtalkController {
     if (!runtime || typeof runtime.start !== 'function' || typeof runtime.stop !== 'function') {
       throw new TypeError('createRuntime returned an invalid DingTalk runtime');
     }
+    if (this.#closed) {
+      await runtime.stop().catch(() => undefined);
+      throw abortError();
+    }
+    this.#runtimes.set(config.botId, runtime);
     try {
       await runtime.start();
       if (this.#closed) {
         await runtime.stop().catch(() => undefined);
         throw abortError();
       }
-      this.#runtimes.set(config.botId, runtime);
     } catch (error) {
+      if (this.#runtimes.get(config.botId) === runtime) this.#runtimes.delete(config.botId);
       await runtime.stop().catch(() => undefined);
       throw error;
     }

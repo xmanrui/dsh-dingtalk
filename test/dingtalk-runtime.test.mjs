@@ -234,6 +234,37 @@ test('runtime never reports ready when connect resolves before the socket opens 
   assert.equal(runtime.status.dingtalkStreamState, 'failed');
 });
 
+test('runtime bounds a stalled SDK gateway lookup and disconnects a late connection', async () => {
+  let finishConnect;
+  let disconnects = 0;
+  const client = {
+    connected: false,
+    socket: { readyState: 0 },
+    registerCallbackListener() {},
+    connect: async () => new Promise((resolve) => { finishConnect = resolve; }),
+    socketCallBackResponse() {},
+    disconnect() { disconnects += 1; },
+  };
+  const runtime = new DingtalkRuntime({
+    config: { clientId: 'ding-client', approvedSenders: [] },
+    clientSecret: 'host-secret',
+    harness: { ensureRunning: async () => true },
+    state: stateFixture(),
+    api: { sendText: async () => true },
+    streamFactory: async () => ({ client, topic: 'robot-topic' }),
+    connectTimeoutMs: 10,
+    connectPollIntervalMs: 2,
+    logger: { warn() {}, error() {} },
+  });
+
+  await assert.rejects(runtime.start(), /handshake timed out after 10ms/);
+  assert.equal(disconnects, 1);
+  finishConnect();
+  await eventually(() => disconnects === 2);
+  assert.equal(runtime.status.ready, false);
+  assert.equal(runtime.status.dingtalkStreamState, 'failed');
+});
+
 test('a callback from a stopped stream is not acknowledged or processed', async () => {
   const events = [];
   let callback;

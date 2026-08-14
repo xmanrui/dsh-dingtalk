@@ -307,7 +307,7 @@ test('close waits for an in-flight transition and leaves no connected runtime be
   }]);
   const credentials = credentialsFixture();
   credentials.values.set(identity.secretRef, 'secret-close');
-  let releaseStart;
+  let rejectStart;
   let stops = 0;
   const controller = new DingtalkController({
     deviceAuth: successfulDeviceAuth(),
@@ -315,8 +315,11 @@ test('close waits for an in-flight transition and leaves no connected runtime be
     configStore: configs.store,
     createRuntime: async () => ({
       status: { ready: false },
-      start: async () => new Promise((resolve) => { releaseStart = resolve; }),
-      stop: async () => { stops += 1; },
+      start: async () => new Promise((_, reject) => { rejectStart = reject; }),
+      stop: async () => {
+        stops += 1;
+        rejectStart?.(new DOMException('Runtime stopped', 'AbortError'));
+      },
     }),
     logger: { warn() {}, error() {} },
   });
@@ -324,7 +327,13 @@ test('close waits for an in-flight transition and leaves no connected runtime be
   const initializing = controller.initialize();
   await flush();
   const closing = controller.close();
-  releaseStart();
+  await Promise.race([
+    closing,
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error('controller close did not stop the provisional runtime')),
+      100,
+    )),
+  ]);
   await Promise.allSettled([initializing, closing]);
 
   assert.ok(stops >= 1);
