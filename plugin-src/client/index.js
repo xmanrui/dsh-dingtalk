@@ -61,10 +61,6 @@ function Heading({ totals, adding, busy, onAdd, addButtonRef }) {
             }),
             h('span', null, `${totals.connected} / ${totals.configured} 在线`))
         : null,
-      totals.pendingApproval > 0
-        ? h('div', { className: 'ddt-badge', 'data-tone': 'attention' },
-            `${totals.pendingApproval} 个待批准`)
-        : null,
       h('div', {
         className: 'ddt-badge',
         title: '应用密钥只写入 Harness Host 凭据服务，不会发送到浏览器',
@@ -186,50 +182,6 @@ function checkedTime(value) {
   }
 }
 
-function SenderAccess({ account, busy, onApprove, onRevoke }) {
-  const pending = account.senders.pending;
-  const approved = account.senders.approved;
-  return h('section', { className: 'ddt-access', 'aria-label': `${account.bot.name}使用者权限` },
-    h('div', { className: 'ddt-accessHeader' },
-      h('div', null,
-        h('h4', null, '允许使用机器人的钉钉账号'),
-        h('p', null, '新使用者首次发消息后会出现在这里，须在本机明确批准。')),
-      h('span', {
-        className: 'ddt-accessCount',
-        'data-pending': pending.length > 0 ? 'true' : undefined,
-      }, pending.length > 0 ? `${pending.length} 个待批准` : `${approved.length} 个已批准`)),
-    pending.length > 0
-      ? h('ul', { className: 'ddt-senderList' }, pending.map((sender) => h('li', {
-          className: 'ddt-sender', key: sender.requestId,
-        },
-        h('div', { className: 'ddt-senderIdentity' },
-          h('strong', null, sender.displayName),
-          h('span', null, `${sender.senderIdMasked} · ${sender.conversationType === 'group' ? '群聊' : '单聊'}`)),
-        h(Button, {
-          kind: 'primary',
-          onClick: () => onApprove(sender),
-          disabled: Boolean(busy),
-        }, busy === `approve:${sender.requestId}` ? '批准中…' : '批准使用'))))
-      : null,
-    approved.length > 0 ? h(React.Fragment, null,
-      h('div', { className: 'ddt-approvedLabel' }, '已批准'),
-      h('ul', { className: 'ddt-senderList' }, approved.map((sender) => h('li', {
-        className: 'ddt-sender', key: sender.senderKey,
-      },
-      h('div', { className: 'ddt-senderIdentity' },
-        h('strong', null, sender.displayName),
-        h('span', null, sender.senderIdMasked)),
-      h(Button, {
-        kind: 'quiet',
-        onClick: () => onRevoke(sender),
-        disabled: Boolean(busy),
-      }, busy === `revoke:${sender.senderKey}` ? '撤销中…' : '撤销')))))
-      : null,
-    pending.length === 0 && approved.length === 0
-      ? h('p', { className: 'ddt-noSenders' }, '尚无使用请求。机器人收到第一条消息后，可在此批准发送者。')
-      : null);
-}
-
 function RemoveConfirmation({ account, busy, onConfirm, onCancel }) {
   const cancelRef = React.useRef(null);
   React.useEffect(() => cancelRef.current?.focus(), []);
@@ -242,7 +194,7 @@ function RemoveConfirmation({ account, busy, onConfirm, onCancel }) {
     },
   },
   h('strong', null, `从 DeepSeek Harness 移除“${account.bot.name}”？`),
-  h('p', null, '这会停止消息连接，并删除本机保存的应用凭据、机器人配置、会话映射及使用者批准记录。钉钉开放平台中的机器人不会被自动删除。'),
+  h('p', null, '这会停止消息连接，并删除本机保存的应用凭据、机器人配置及会话映射。钉钉开放平台中的机器人不会被自动删除。'),
   h('div', { className: 'ddt-actions' },
     h(Button, { ref: cancelRef, onClick: onCancel, disabled: busy }, '保留机器人'),
     h(Button, { kind: 'danger', onClick: onConfirm, disabled: busy },
@@ -257,8 +209,6 @@ function AccountCard({
   onRequestRemove,
   onConfirmRemove,
   onCancelRemove,
-  onApprove,
-  onRevoke,
 }) {
   const state = busy === 'reconnect' ? 'connecting' : account.state;
   const tone = account.connected ? 'success' : state === 'error' ? 'error' : 'warning';
@@ -280,7 +230,6 @@ function AccountCard({
           h('dd', null, `${account.stats.messagesReceived} / ${account.stats.messagesReplied}`)),
         h('div', { className: 'ddt-metric' }, h('dt', null, '最近检查'),
           h('dd', null, checkedTime(account.health.lastCheckedAt)))),
-      h(SenderAccess, { account, busy, onApprove, onRevoke }),
       h('div', { className: 'ddt-accountFooter' },
         h('div', { className: 'ddt-summary' }, account.error?.message ?? account.health.summary),
         h('div', { className: 'ddt-actions' },
@@ -309,12 +258,10 @@ function AccountList(props) {
         onRequestRemove: () => props.onRequestRemove(account),
         onConfirmRemove: () => props.onConfirmRemove(account),
         onCancelRemove: props.onCancelRemove,
-        onApprove: (sender) => props.onApprove(account, sender),
-        onRevoke: (sender) => props.onRevoke(account, sender),
       })))));
 }
 
-const EMPTY_TOTALS = Object.freeze({ configured: 0, connected: 0, pendingApproval: 0 });
+const EMPTY_TOTALS = Object.freeze({ configured: 0, connected: 0 });
 
 export function DingtalkSettingsTab({ rpcCall }) {
   const [model, setModel] = React.useState({
@@ -635,22 +582,6 @@ export function DingtalkSettingsTab({ rpcCall }) {
     if (snapshot && mountedRef.current) setRemoveTarget(null);
   }, [runBotAction]);
 
-  const approve = React.useCallback((account, sender) => runBotAction({
-    account,
-    operation: `approve:${sender.requestId}`,
-    endpoint: DINGTALK_ENDPOINTS.approveSender,
-    payload: { botId: account.botId, requestId: sender.requestId, confirm: true },
-    success: `已批准 ${sender.displayName} 使用这个机器人。`,
-  }), [runBotAction]);
-
-  const revoke = React.useCallback((account, sender) => runBotAction({
-    account,
-    operation: `revoke:${sender.senderKey}`,
-    endpoint: DINGTALK_ENDPOINTS.revokeSender,
-    payload: { botId: account.botId, senderKey: sender.senderKey, confirm: true },
-    success: `已撤销 ${sender.displayName} 的使用权限。`,
-  }), [runBotAction]);
-
   let provisionView = null;
   if (provision?.status === 'starting') {
     provisionView = h('div', { className: 'ddt-card ddt-loading', 'aria-busy': 'true' },
@@ -712,8 +643,6 @@ export function DingtalkSettingsTab({ rpcCall }) {
                   onRequestRemove: (account) => setRemoveTarget(account.botId),
                   onConfirmRemove: (account) => void remove(account),
                   onCancelRemove: () => setRemoveTarget(null),
-                  onApprove: (account, sender) => void approve(account, sender),
-                  onRevoke: (account, sender) => void revoke(account, sender),
                 })
               : null));
 }

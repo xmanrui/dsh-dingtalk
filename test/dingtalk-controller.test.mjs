@@ -82,7 +82,9 @@ function runtimeFactory({ events = [], pendingByClient = new Map(), failStart = 
         },
         async start() {
           events.push(['start', botId]);
-          if (failStart) throw new Error('runtime failure containing private-secret');
+          if (typeof failStart === 'function' ? failStart() : failStart) {
+            throw new Error('runtime failure containing private-secret');
+          }
           ready = true;
         },
         async stop() {
@@ -224,15 +226,58 @@ test('sender approval uses opaque request and sender keys while raw staff IDs st
   await controller.close();
 });
 
-test('activation failure rolls back secret and config without exposing the failing detail', async () => {
-  const credentials = credentialsFixture();
-  const configs = configFixture();
-  const runtimes = runtimeFactory({ failStart: true });
+test('runtime activation failure retains the authorized bot for reconnect without exposing detail', async () => {
+  let startCount = 0;
+  const events = [];
+  const credentials = credentialsFixture(events);
+  const configs = configFixture([], events);
+  const runtimes = runtimeFactory({ events, failStart: () => startCount++ === 0 });
   const controller = new DingtalkController({
     deviceAuth: successfulDeviceAuth(),
     credentials: credentials.provider,
     configStore: configs.store,
     createRuntime: runtimes.createRuntime,
+    logger: { error() {}, warn() {} },
+    clock: () => 1_000,
+  });
+  const begun = await controller.startProvisioning();
+  const completed = await controller.registrationStatus(begun.attemptId);
+
+  assert.equal(completed.status, 'connected');
+  assert.equal(credentials.values.size, 1);
+  assert.equal(configs.bots.size, 1);
+  const status = controller.status();
+  assert.deepEqual(status.totals, { configured: 1, connected: 0 });
+  assert.equal(status.bots[0].state, 'error');
+  assert.equal(status.bots[0].error.code, 'connection-failed');
+  assert.equal(events.some(([event]) => event === 'unset' || event === 'remove'), false);
+  assert.doesNotMatch(
+    JSON.stringify({ completed, status }),
+    /private-secret|client-secret-private|device-code-private|secretRef/,
+  );
+
+  const reconnected = await controller.reconnectBot(completed.botId);
+  assert.deepEqual(reconnected.totals, { configured: 1, connected: 1 });
+  assert.equal(reconnected.bots[0].state, 'connected');
+  assert.equal(reconnected.bots[0].error, null);
+  assert.equal(credentials.values.size, 1);
+  assert.equal(configs.bots.size, 1);
+  await controller.close();
+});
+
+test('config persistence failure rolls back the newly stored credential', async () => {
+  const credentials = credentialsFixture();
+  const configs = configFixture();
+  const controller = new DingtalkController({
+    deviceAuth: successfulDeviceAuth(),
+    credentials: credentials.provider,
+    configStore: {
+      ...configs.store,
+      save: async () => {
+        throw new Error('config failure containing private-secret');
+      },
+    },
+    createRuntime: runtimeFactory().createRuntime,
     logger: { error() {}, warn() {} },
     clock: () => 1_000,
   });
@@ -244,6 +289,44 @@ test('activation failure rolls back secret and config without exposing the faili
   assert.equal(credentials.values.size, 0);
   assert.equal(configs.bots.size, 0);
   assert.doesNotMatch(JSON.stringify(failed), /private-secret|client-secret-private|device-code-private/);
+  await controller.close();
+});
+
+test('cancelling while the persisted bot is starting rolls its binding back', async () => {
+  const credentials = credentialsFixture();
+  const configs = configFixture();
+  let enteredStart;
+  let releaseStart;
+  const startEntered = new Promise((resolve) => { enteredStart = resolve; });
+  const controller = new DingtalkController({
+    deviceAuth: successfulDeviceAuth(),
+    credentials: credentials.provider,
+    configStore: configs.store,
+    createRuntime: async () => ({
+      status: { ready: false },
+      start: async () => new Promise((resolve) => {
+        releaseStart = resolve;
+        enteredStart();
+      }),
+      stop: async () => {},
+    }),
+    logger: { error() {}, warn() {} },
+    clock: () => 1_000,
+  });
+  const begun = await controller.startProvisioning();
+  const polling = controller.registrationStatus(begun.attemptId);
+  await startEntered;
+  assert.equal(credentials.values.size, 1);
+  assert.equal(configs.bots.size, 1);
+
+  const cancelling = controller.cancelProvisioning(begun.attemptId);
+  releaseStart();
+  const [cancelled, polled] = await Promise.all([cancelling, polling]);
+
+  assert.equal(cancelled.status, 'cancelled');
+  assert.equal(polled.status, 'cancelled');
+  assert.equal(credentials.values.size, 0);
+  assert.equal(configs.bots.size, 0);
   await controller.close();
 });
 

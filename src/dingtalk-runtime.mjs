@@ -24,9 +24,7 @@ function approvedSenderCount(config) {
 }
 
 function streamIsOpen(client) {
-  const socketOpen = client?.connected === true || client?.socket?.readyState === 1;
-  const registrationReady = typeof client?.registered !== 'boolean' || client.registered === true;
-  return socketOpen && registrationReady;
+  return client?.connected === true || client?.socket?.readyState === 1;
 }
 
 function abortable(promise, signal) {

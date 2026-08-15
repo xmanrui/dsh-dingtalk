@@ -2,11 +2,10 @@ import {
   normalizeDingtalkSessionWebhook,
   splitDingtalkText,
 } from './dingtalk-api.mjs';
+import { createDingTalkCardStream } from './dingtalk-card-stream.mjs';
 
-export const PENDING_SENDER_REPLY = [
-  '此发送者尚未获准使用机器人。',
-  '请在运行 DeepSeek Harness 的这台电脑上打开「插件 → IM机器人 → 钉钉」，批准后再发送消息。',
-].join('\n');
+const CARD_INITIAL_TEXT = '已连接 DeepSeek Harness，正在思考…';
+const CARD_ERROR_TEXT = '消息处理失败，请稍后重试。';
 
 const HELP_TEXT = [
   '钉钉机器人已连接 DeepSeek Harness。',
@@ -34,11 +33,20 @@ function conversationKey(message, sender) {
   return `p2p:${sender}`;
 }
 
-function approvedStaffIds(values) {
-  const entries = values instanceof Set ? [...values] : Array.isArray(values) ? values : [];
-  return new Set(entries.map((entry) => nonEmptyString(
-    typeof entry === 'string' ? entry : entry?.staffId,
-  )).filter(Boolean));
+function cardTarget(message, sender) {
+  if (String(message?.conversationType) === '2') {
+    return { type: 'group', openConversationId: nonEmptyString(message?.conversationId) };
+  }
+  return { type: 'user', userId: sender };
+}
+
+function progressText(update) {
+  if (update?.type === 'text' && nonEmptyString(update.text)) return update.text;
+  if (update?.type === 'tool') {
+    if (update.name === 'web_search') return '_正在搜索网络并整理信息…_';
+    return `_正在使用 ${nonEmptyString(update.name) ?? '工具'}…_`;
+  }
+  return `_${nonEmptyString(update?.text) ?? '正在处理…'}_`;
 }
 
 function ensureStats(status) {
@@ -80,7 +88,6 @@ export class DingtalkHarnessBridge {
   #api;
   #clientId;
   #clientSecret;
-  #approvedStaffIds;
   #harness;
   #state;
   #status;
@@ -95,8 +102,6 @@ export class DingtalkHarnessBridge {
     api,
     clientId,
     clientSecret,
-    approvedSenders,
-    allowedSenderStaffIds,
     harness,
     state,
     status = createDingtalkBridgeStatus(),
@@ -113,7 +118,6 @@ export class DingtalkHarnessBridge {
     this.#api = api;
     this.#clientId = clientId.trim();
     this.#clientSecret = clientSecret.trim();
-    this.#approvedStaffIds = approvedStaffIds(approvedSenders ?? allowedSenderStaffIds);
     this.#harness = harness;
     this.#state = state;
     this.#status = status;
@@ -185,31 +189,9 @@ export class DingtalkHarnessBridge {
       return;
     }
 
-    if (!this.#approvedStaffIds.has(sender)) {
-      increment(this.#status, 'messagesRejected');
-      this.#status.lastRejectedAt = new Date().toISOString();
-      await this.#state.recordPendingSender({
-        staffId: sender,
-        displayName: nonEmptyString(message.senderNick) ?? '钉钉用户',
-        lastSeenAt: this.#status.lastRejectedAt,
-      });
-      this.#refreshPendingSenders();
-      try {
-        await this.#send(sessionWebhook, PENDING_SENDER_REPLY);
-      } catch {
-        if (this.#signal?.aborted) return;
-        this.#status.lastError = '无法发送本机批准提示。';
-        this.#logger.warn?.('[dsh-dingtalk] unable to send the local approval prompt');
-      }
-      return;
-    }
-
-    if (typeof this.#state.removePendingSenderByStaffId === 'function') {
-      await this.#state.removePendingSenderByStaffId(sender);
-      this.#refreshPendingSenders();
-    }
-
     const text = message?.msgtype === 'text' ? nonEmptyString(message?.text?.content) : null;
+    let cardStream = null;
+    let cardStarted = false;
     try {
       if (!text) {
         await this.#send(sessionWebhook, '目前仅支持文字消息。');
@@ -237,11 +219,28 @@ export class DingtalkHarnessBridge {
         sessionId = await this.#harness.createSession({ signal: this.#signal });
         await this.#state.setSession(key, sessionId);
       }
+      if (typeof this.#api.createAiCard === 'function'
+        && typeof this.#api.updateAiCard === 'function'
+        && typeof this.#api.finishAiCard === 'function') {
+        cardStream = createDingTalkCardStream({
+          api: this.#api,
+          clientId: this.#clientId,
+          clientSecret: this.#clientSecret,
+          target: cardTarget(message, sender),
+          signal: this.#signal,
+          logger: this.#logger,
+        });
+        cardStarted = await cardStream.start(CARD_INITIAL_TEXT);
+      }
       const answer = await this.#harness.ask(sessionId, text, {
         timeoutMs: this.#replyTimeoutMs,
         signal: this.#signal,
+        onUpdate: cardStarted
+          ? (update) => cardStream.push(progressText(update))
+          : undefined,
       });
-      await this.#send(sessionWebhook, answer);
+      const streamed = cardStarted && await cardStream.finish(answer);
+      if (!streamed) await this.#send(sessionWebhook, answer);
       increment(this.#status, 'messagesReplied');
       this.#status.lastReplyAt = new Date().toISOString();
       this.#status.lastError = null;
@@ -250,7 +249,8 @@ export class DingtalkHarnessBridge {
       this.#status.lastError = '钉钉消息处理失败。';
       this.#logger.error?.('[dsh-dingtalk] failed to process an inbound message');
       try {
-        await this.#send(sessionWebhook, '消息处理失败，请稍后重试。');
+        const streamed = cardStarted && await cardStream.finish(CARD_ERROR_TEXT);
+        if (!streamed) await this.#send(sessionWebhook, CARD_ERROR_TEXT);
       } catch {
         this.#logger.error?.('[dsh-dingtalk] failed to send the safe error reply');
       }

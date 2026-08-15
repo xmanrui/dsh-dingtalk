@@ -28,12 +28,10 @@ test('QR guidance describes the complete official DingTalk authorization flow', 
   assert.doesNotMatch(source, /dangerouslySetInnerHTML|window\.open\(/);
 });
 
-test('sender approvals require explicit confirmation and never use a raw sender id', async () => {
+test('the settings page has no local sender approval workflow', async () => {
   const source = await readFile(CLIENT_URL, 'utf8');
-  assert.match(source, /payload: \{ botId: account\.botId, requestId: sender\.requestId, confirm: true \}/);
-  assert.match(source, /payload: \{ botId: account\.botId, senderKey: sender\.senderKey, confirm: true \}/);
   assert.match(source, /payload: \{ botId: account\.botId, confirm: true \}/);
-  assert.doesNotMatch(source, /sender\.senderId\b/);
+  assert.doesNotMatch(source, /SenderAccess|approveSender|revokeSender|待批准|已批准|批准使用/);
 });
 
 test('the client uses an isolated compact and accessible DingTalk style namespace', async () => {
@@ -63,4 +61,26 @@ test('the QR card responds to its plugin panel width instead of the browser view
   assert.match(styles, /\.ddt-qrLayout \{[^\n]*align-items: start;/);
   assert.match(styles, /\.ddt-qrColumn \{ width: 100%; min-width: 0; \}/);
   assert.match(styles, /\.ddt-qrCopy \{ min-width: 0; overflow-wrap: anywhere; \}/);
+});
+
+test('bot metrics stay in one compact three-column row at narrow widths', async () => {
+  const styles = await readFile(STYLES_URL, 'utf8');
+  assert.match(
+    styles,
+    /\.ddt-metrics \{[^\n]*grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/,
+  );
+  assert.doesNotMatch(
+    styles,
+    /\.ddt-metrics \{ grid-template-columns: minmax\(0, 1fr\); \}/,
+  );
+});
+
+test('the narrow-panel toolbar keeps all three controls on one row', async () => {
+  const styles = await readFile(STYLES_URL, 'utf8');
+  assert.match(
+    styles,
+    /@container \(max-width: 680px\)[\s\S]*\.ddt-tools \{ width: 100%; flex-wrap: nowrap; gap: 6px; \}/,
+  );
+  assert.match(styles, /\.ddt-tools \.ddt-badge \{ min-height: 34px;/);
+  assert.match(styles, /\.ddt-tools \.ddt-button \{[^\n]*white-space: nowrap;/);
 });

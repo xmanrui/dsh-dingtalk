@@ -3,7 +3,9 @@ import test from 'node:test';
 
 import {
   createDingtalkApi,
+  DINGTALK_AI_CARD_TEMPLATE_ID,
   DINGTALK_API_BASE_URL,
+  normalizeDingtalkCardMarkdown,
   normalizeDingtalkSessionWebhook,
   splitDingtalkText,
 } from '../src/dingtalk-api.mjs';
@@ -14,6 +16,12 @@ function jsonResponse(value, { status = 200 } = {}) {
     status,
     json: async () => value,
   };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
 }
 
 test('registration API performs init, begin, and poll with normalized results', async () => {
@@ -39,7 +47,7 @@ test('registration API performs init, begin, and poll with normalized results', 
       client_secret: 'host-only-secret',
     });
   };
-  const api = createDingtalkApi({ fetchImpl });
+  const api = createDingtalkApi({ fetchImpl, cardMinIntervalMs: 0, cardBackoffMs: 0 });
 
   const begun = await api.beginRegistration();
   const polled = await api.pollRegistration({ deviceCode: begun.deviceCode });
@@ -122,6 +130,201 @@ test('session webhook validation accepts only HTTPS DingTalk hosts on the defaul
   ]) {
     assert.throws(() => normalizeDingtalkSessionWebhook(value), /不受信任/);
   }
+});
+
+test('AI Card replies create, deliver, stream full snapshots, and finalize on fixed endpoints', async () => {
+  const calls = [];
+  const fetchImpl = async (url, options) => {
+    calls.push({ url: url.toString(), options });
+    if (url.toString() === `${DINGTALK_API_BASE_URL}v1.0/oauth2/accessToken`) {
+      return jsonResponse({ accessToken: 'access-token', expireIn: 7_200 });
+    }
+    return jsonResponse({});
+  };
+  const api = createDingtalkApi({ fetchImpl, cardMinIntervalMs: 0, cardBackoffMs: 0 });
+  const credentials = { clientId: 'ding-client', clientSecret: 'host-only-secret' };
+  const card = await api.createAiCard({
+    ...credentials,
+    target: { type: 'user', userId: 'staff-one' },
+    initialText: '正在处理…',
+  });
+  await api.updateAiCard({ ...credentials, ...card, text: '第一行\n第二行' });
+  await api.finishAiCard({ ...credentials, ...card, text: '最终回答' });
+
+  const cardCalls = calls.slice(1).map(({ url, options }) => ({
+    method: options.method,
+    path: new URL(url).pathname,
+    body: JSON.parse(options.body),
+    token: options.headers['x-acs-dingtalk-access-token'],
+    redirect: options.redirect,
+  }));
+  assert.deepEqual(cardCalls.map(({ method, path }) => ({ method, path })), [
+    { method: 'POST', path: '/v1.0/card/instances' },
+    { method: 'POST', path: '/v1.0/card/instances/deliver' },
+    { method: 'PUT', path: '/v1.0/card/instances' },
+    { method: 'PUT', path: '/v1.0/card/streaming' },
+    { method: 'PUT', path: '/v1.0/card/streaming' },
+    { method: 'PUT', path: '/v1.0/card/streaming' },
+    { method: 'PUT', path: '/v1.0/card/instances' },
+  ]);
+  assert.ok(cardCalls.every(({ token, redirect }) => token === 'access-token' && redirect === 'error'));
+  assert.equal(cardCalls[0].body.cardTemplateId, DINGTALK_AI_CARD_TEMPLATE_ID);
+  assert.equal(cardCalls[0].body.outTrackId, card.cardInstanceId);
+  assert.equal(cardCalls[1].body.openSpaceId, 'dtv1.card//IM_ROBOT.staff-one');
+  assert.equal(cardCalls[1].body.imRobotOpenDeliverModel.robotCode, 'ding-client');
+  assert.equal(cardCalls[2].body.cardData.cardParamMap.flowStatus, '2');
+  assert.equal(cardCalls[3].body.content, '正在处理…');
+  assert.equal(cardCalls[4].body.content, '第一行<br>第二行');
+  assert.equal(cardCalls[4].body.isFull, true);
+  assert.equal(cardCalls[4].body.isFinalize, false);
+  assert.equal(cardCalls[5].body.content, '最终回答');
+  assert.equal(cardCalls[5].body.isFinalize, true);
+  assert.equal(cardCalls[6].body.cardData.cardParamMap.flowStatus, '3');
+});
+
+test('AI Card markdown preserves fenced code while rendering ordinary line breaks', () => {
+  assert.equal(normalizeDingtalkCardMarkdown('一\n二'), '一<br>二');
+  assert.equal(
+    normalizeDingtalkCardMarkdown('```js\nconst answer = 42\n```\n完成'),
+    '```js\nconst answer = 42\n```\n完成',
+  );
+});
+
+test('AI Card start slots preserve 20 QPS without blocking cleanup behind slow HTTP', async () => {
+  const firstUpdate = deferred();
+  const bodies = [];
+  const waits = [];
+  let now = 0;
+  const fetchImpl = async (url, options) => {
+    if (url.toString() === `${DINGTALK_API_BASE_URL}v1.0/oauth2/accessToken`) {
+      return jsonResponse({ accessToken: 'access-token', expireIn: 7_200 });
+    }
+    const body = JSON.parse(options.body);
+    bodies.push(body);
+    if (new URL(url).pathname === '/v1.0/card/streaming' && body.isError === false) {
+      await firstUpdate.promise;
+    }
+    return jsonResponse({});
+  };
+  const api = createDingtalkApi({
+    fetchImpl,
+    now: () => now,
+    cardMinIntervalMs: 50,
+    delay: async (ms) => {
+      waits.push(ms);
+      now += ms;
+    },
+  });
+  const request = {
+    clientId: 'ding-client',
+    clientSecret: 'host-only-secret',
+    cardInstanceId: 'card-one',
+  };
+
+  const slowUpdate = api.updateAiCard({ ...request, text: '仍在请求中' });
+  await new Promise((resolve) => setImmediate(resolve));
+  await api.failAiCard({ ...request, text: '及时收口' });
+
+  assert.equal(bodies.some((body) => body.isError === true), true);
+  assert.equal(bodies.some((body) => body.cardData?.cardParamMap?.flowStatus === '5'), true);
+  assert.deepEqual(waits, [50, 50]);
+  firstUpdate.resolve();
+  await slowUpdate;
+});
+
+test('AI Card retries one QPS rejection after the configured backoff', async () => {
+  let attempts = 0;
+  const waits = [];
+  const fetchImpl = async (url) => {
+    if (url.toString() === `${DINGTALK_API_BASE_URL}v1.0/oauth2/accessToken`) {
+      return jsonResponse({ accessToken: 'access-token', expireIn: 7_200 });
+    }
+    attempts += 1;
+    return attempts === 1 ? jsonResponse({}, { status: 403 }) : jsonResponse({});
+  };
+  const api = createDingtalkApi({
+    fetchImpl,
+    cardMinIntervalMs: 0,
+    cardBackoffMs: 1_000,
+    delay: async (ms) => waits.push(ms),
+  });
+
+  await api.updateAiCard({
+    clientId: 'ding-client',
+    clientSecret: 'host-only-secret',
+    cardInstanceId: 'card-one',
+    text: '重试内容',
+  });
+
+  assert.equal(attempts, 2);
+  assert.deepEqual(waits, [1_000]);
+});
+
+test('AI Card cleanup marks failure while a completed final frame never falls back twice', async () => {
+  const calls = [];
+  let rejectCompletedStatus = true;
+  const fetchImpl = async (url, options) => {
+    calls.push({ url: url.toString(), options });
+    if (url.toString() === `${DINGTALK_API_BASE_URL}v1.0/oauth2/accessToken`) {
+      return jsonResponse({ accessToken: 'access-token', expireIn: 7_200 });
+    }
+    const body = JSON.parse(options.body);
+    if (rejectCompletedStatus
+      && new URL(url).pathname === '/v1.0/card/instances'
+      && body.cardData?.cardParamMap?.flowStatus === '3') {
+      return jsonResponse({}, { status: 500 });
+    }
+    return jsonResponse({});
+  };
+  const api = createDingtalkApi({ fetchImpl, cardMinIntervalMs: 0, cardBackoffMs: 0 });
+  const request = {
+    clientId: 'ding-client',
+    clientSecret: 'host-only-secret',
+    cardInstanceId: 'card-one',
+  };
+
+  assert.deepEqual(await api.finishAiCard({ ...request, text: '最终答案' }), {
+    delivered: true,
+    completed: false,
+  });
+  rejectCompletedStatus = false;
+  await api.failAiCard({ ...request, text: '处理失败' });
+
+  const bodies = calls
+    .filter(({ url }) => new URL(url).pathname.startsWith('/v1.0/card/'))
+    .map(({ options }) => JSON.parse(options.body));
+  assert.equal(bodies.some((body) => body.isFinalize === true && body.isError === false), true);
+  assert.equal(bodies.some((body) => body.isError === true), true);
+  assert.equal(bodies.some((body) => body.cardData?.cardParamMap?.flowStatus === '5'), true);
+});
+
+test('AI Card creation closes a delivered card with an independent signal after abort', async () => {
+  const controller = new AbortController();
+  const bodies = [];
+  const fetchImpl = async (url, options) => {
+    if (url.toString() === `${DINGTALK_API_BASE_URL}v1.0/oauth2/accessToken`) {
+      return jsonResponse({ accessToken: 'access-token', expireIn: 7_200 });
+    }
+    const body = JSON.parse(options.body);
+    bodies.push(body);
+    if (options.method === 'PUT' && body.cardData?.cardParamMap?.flowStatus === '2') {
+      controller.abort(new DOMException('stopped', 'AbortError'));
+      throw controller.signal.reason;
+    }
+    return jsonResponse({});
+  };
+  const api = createDingtalkApi({ fetchImpl, cardMinIntervalMs: 0, cardBackoffMs: 0 });
+
+  await assert.rejects(api.createAiCard({
+    clientId: 'ding-client',
+    clientSecret: 'host-only-secret',
+    target: { type: 'user', userId: 'staff-one' },
+    initialText: '正在处理',
+    signal: controller.signal,
+  }), { name: 'AbortError' });
+
+  assert.equal(bodies.some((body) => body.isError === true), true);
+  assert.equal(bodies.some((body) => body.cardData?.cardParamMap?.flowStatus === '5'), true);
 });
 
 test('text splitting prefers line boundaries and never produces oversized chunks', () => {

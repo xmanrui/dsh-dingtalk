@@ -7,8 +7,6 @@ export const DINGTALK_ENDPOINTS = Object.freeze({
   cancelProvisioning: 'provision.cancel',
   reconnectBot: 'bot.reconnect',
   deleteBot: 'bot.delete',
-  approveSender: 'bot.sender.approve',
-  revokeSender: 'bot.sender.revoke',
 });
 
 const ACCOUNT_STATES = new Set(['connected', 'connecting', 'offline', 'error']);
@@ -131,59 +129,6 @@ export function normalizeProvisioning(value, now = Date.now()) {
   return result;
 }
 
-function normalizeConversationType(value) {
-  if (value === 'group' || value === '2') return 'group';
-  return 'direct';
-}
-
-function normalizePendingSender(value) {
-  if (!isRecord(value)) return undefined;
-  const requestId = opaqueId(value.requestId);
-  if (!requestId) return undefined;
-  return {
-    requestId,
-    displayName: optionalString(value.displayName, 80) ?? '待批准使用者',
-    senderIdMasked: optionalString(value.senderIdMasked, 120) ?? '身份已隐藏',
-    conversationType: normalizeConversationType(value.conversationType),
-    requestedAt: timestamp(value.requestedAt),
-  };
-}
-
-function normalizeApprovedSender(value) {
-  if (!isRecord(value)) return undefined;
-  const senderKey = opaqueId(value.senderKey);
-  if (!senderKey) return undefined;
-  return {
-    senderKey,
-    displayName: optionalString(value.displayName, 80) ?? '已批准使用者',
-    senderIdMasked: optionalString(value.senderIdMasked, 120) ?? '身份已隐藏',
-    approvedAt: timestamp(value.approvedAt),
-  };
-}
-
-function uniqueBy(items, key) {
-  const seen = new Set();
-  return items.filter((item) => {
-    if (!item || seen.has(item[key])) return false;
-    seen.add(item[key]);
-    return true;
-  });
-}
-
-function normalizeSenders(value) {
-  const source = isRecord(value) ? value : {};
-  return {
-    pending: uniqueBy(
-      (Array.isArray(source.pending) ? source.pending : []).map(normalizePendingSender),
-      'requestId',
-    ),
-    approved: uniqueBy(
-      (Array.isArray(source.approved) ? source.approved : []).map(normalizeApprovedSender),
-      'senderKey',
-    ),
-  };
-}
-
 function normalizeBot(value) {
   if (!isRecord(value)) return undefined;
   const botId = opaqueId(value.botId);
@@ -194,7 +139,6 @@ function normalizeBot(value) {
   const state = connected ? 'connected' : reportedState === 'connected' ? 'connecting' : reportedState;
   const health = isRecord(value.health) ? value.health : {};
   const stats = isRecord(value.stats) ? value.stats : {};
-  const senderSource = value.senders ?? value.senderPolicy ?? value.access;
   return {
     botId,
     state,
@@ -217,7 +161,6 @@ function normalizeBot(value) {
       messagesReceived: nonNegativeInteger(stats.messagesReceived),
       messagesReplied: nonNegativeInteger(stats.messagesReplied),
     },
-    senders: normalizeSenders(senderSource),
     error: normalizeError(value.error, 'DINGTALK_ACCOUNT_ERROR', '钉钉连接尚未就绪') ?? null,
   };
 }
@@ -241,7 +184,6 @@ export function normalizeSnapshot(value) {
     totals: {
       configured: bots.length,
       connected: bots.filter((bot) => bot.connected).length,
-      pendingApproval: bots.reduce((total, bot) => total + bot.senders.pending.length, 0),
     },
     provisioning: source.provisioning ? normalizeProvisioning(source.provisioning) : null,
   };

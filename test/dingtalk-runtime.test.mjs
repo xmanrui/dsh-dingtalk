@@ -136,8 +136,10 @@ test('runtime owns one DWClient, waits for socket OPEN, acknowledges first, and 
   assert.equal(runtime.status.dingtalkStreamState, 'idle');
 });
 
-test('runtime exposes pending sender mappings to the host controller', async () => {
+test('runtime sends visible-scope messages to Harness without local sender approval', async () => {
   const state = stateFixture();
+  const asked = [];
+  const sent = [];
   let callback;
   const client = {
     connected: true,
@@ -150,9 +152,17 @@ test('runtime exposes pending sender mappings to the host controller', async () 
   const runtime = new DingtalkRuntime({
     config: { clientId: 'ding-client', approvedSenders: [] },
     clientSecret: 'host-secret',
-    harness: { ensureRunning: async () => true },
+    harness: {
+      ensureRunning: async () => true,
+      sessionExists: async () => false,
+      createSession: async () => 'session-visible-sender',
+      ask: async (sessionId, text) => {
+        asked.push({ sessionId, text });
+        return '直接回答';
+      },
+    },
     state,
-    api: { sendText: async () => true },
+    api: { sendText: async ({ text }) => sent.push(text) },
     streamFactory: async () => ({ client, topic: 'robot-topic' }),
   });
   await runtime.start();
@@ -164,28 +174,28 @@ test('runtime exposes pending sender mappings to the host controller', async () 
       text: { content: '请求使用' },
       conversationType: '1',
       senderStaffId: 'raw-staff-id',
-      senderNick: '待批准',
+      senderNick: '可见范围用户',
       sessionWebhook: 'https://oapi.dingtalk.com/robot/reply?ticket=pending',
     }),
   });
 
-  await eventually(() => runtime.status.pendingSenders.length === 1);
-  const [pending] = runtime.pendingSenders();
-  assert.equal(pending.staffId, 'raw-staff-id');
-  assert.deepEqual(runtime.pendingSender(pending.requestId), pending);
-  assert.doesNotMatch(JSON.stringify(pending), /sessionWebhook|ticket=pending/);
+  await eventually(() => runtime.status.messagesReplied === 1);
+  assert.deepEqual(asked, [{
+    sessionId: 'session-visible-sender',
+    text: '请求使用',
+  }]);
+  assert.deepEqual(sent, ['直接回答']);
+  assert.deepEqual(runtime.pendingSenders(), []);
   await runtime.stop();
 });
 
-test('runtime waits for DingTalk subscription registration after the socket opens', async () => {
+test('runtime accepts an OPEN DingTalk socket when the SDK registered flag remains false', async () => {
   const client = {
     connected: true,
     registered: false,
     socket: { readyState: 1 },
     registerCallbackListener() {},
-    async connect() {
-      setTimeout(() => { this.registered = true; }, 10);
-    },
+    async connect() {},
     socketCallBackResponse() {},
     disconnect() {},
   };
@@ -196,13 +206,10 @@ test('runtime waits for DingTalk subscription registration after the socket open
     state: stateFixture(),
     api: { sendText: async () => true },
     streamFactory: async () => ({ client, topic: 'robot-topic' }),
-    connectPollIntervalMs: 2,
   });
 
-  const starting = runtime.start();
-  await new Promise((resolve) => setTimeout(resolve, 4));
-  assert.equal(runtime.status.ready, false);
-  assert.equal((await starting).ready, true);
+  assert.equal((await runtime.start()).ready, true);
+  assert.equal(client.registered, false);
   await runtime.stop();
 });
 

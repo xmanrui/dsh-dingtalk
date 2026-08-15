@@ -4,7 +4,6 @@ import test from 'node:test';
 import {
   createDingtalkBridgeStatus,
   DingtalkHarnessBridge,
-  PENDING_SENDER_REPLY,
 } from '../src/dingtalk-bridge.mjs';
 
 function message(id, text, overrides = {}) {
@@ -15,7 +14,7 @@ function message(id, text, overrides = {}) {
     conversationType: '1',
     conversationId: `conversation-${id}`,
     senderStaffId: 'staff-approved',
-    senderNick: '已批准用户',
+    senderNick: '钉钉用户',
     sessionWebhook: `https://oapi.dingtalk.com/robot/reply?ticket=${id}`,
     ...overrides,
   };
@@ -58,7 +57,7 @@ function stateFixture() {
   };
 }
 
-test('bridge maps an approved DingTalk direct conversation to one persistent Harness session', async () => {
+test('bridge maps a DingTalk direct conversation to one persistent Harness session', async () => {
   const fixture = stateFixture();
   const sent = [];
   const asked = [];
@@ -67,7 +66,6 @@ test('bridge maps an approved DingTalk direct conversation to one persistent Har
     api: { sendText: async (request) => sent.push(request) },
     clientId: 'ding-client',
     clientSecret: 'host-secret',
-    approvedSenders: [{ staffId: 'staff-approved' }],
     harness: {
       sessionExists: async (sessionId) => sessionId === 'session-one',
       createSession: async () => 'session-one',
@@ -100,45 +98,45 @@ test('bridge maps an approved DingTalk direct conversation to one persistent Har
   assert.equal(status.stats.messagesReplied, 2);
 });
 
-test('unapproved senders become host-only pending requests and never enter Harness', async () => {
+test('senders in the bot visibility scope enter Harness without local approval', async () => {
   const fixture = stateFixture();
   const sent = [];
-  let harnessCalls = 0;
+  const asked = [];
   const status = createDingtalkBridgeStatus();
   const bridge = new DingtalkHarnessBridge({
     api: { sendText: async (request) => sent.push(request) },
     clientId: 'ding-client',
     clientSecret: 'host-secret',
-    approvedSenders: [],
     harness: {
-      sessionExists: async () => { harnessCalls += 1; },
-      createSession: async () => { harnessCalls += 1; },
-      ask: async () => { harnessCalls += 1; },
+      sessionExists: async () => false,
+      createSession: async () => 'session-visible-sender',
+      ask: async (sessionId, text) => {
+        asked.push({ sessionId, text });
+        return '直接回答';
+      },
     },
     state: fixture.state,
     status,
   });
 
-  await bridge.accept(message('pending', '未批准问题', {
+  await bridge.accept(message('visible', '可见范围内的问题', {
     senderStaffId: 'raw-staff-id',
-    senderNick: '待批准用户',
+    senderNick: '可见范围用户',
   }));
 
-  assert.equal(harnessCalls, 0);
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].text, PENDING_SENDER_REPLY);
-  assert.deepEqual(status.pendingSenders, [{
-    requestId: 'request-raw-staff-id',
-    staffId: 'raw-staff-id',
-    displayName: '待批准用户',
-    requestedAt: status.lastRejectedAt,
-    lastSeenAt: status.lastRejectedAt,
+  assert.deepEqual(asked, [{
+    sessionId: 'session-visible-sender',
+    text: '可见范围内的问题',
   }]);
-  assert.doesNotMatch(JSON.stringify(status.pendingSenders), /sessionWebhook|ticket=pending/);
-  assert.equal(status.messagesRejected, 1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].text, '直接回答');
+  assert.equal(fixture.pending.size, 0);
+  assert.deepEqual(status.pendingSenders, []);
+  assert.equal(status.messagesRejected, 0);
+  assert.equal(status.messagesReplied, 1);
 });
 
-test('group messages require an explicit bot mention before authorization or Harness work', async () => {
+test('group messages require an explicit bot mention before Harness work', async () => {
   const fixture = stateFixture();
   const sent = [];
   const asked = [];
@@ -146,7 +144,6 @@ test('group messages require an explicit bot mention before authorization or Har
     api: { sendText: async (request) => sent.push(request) },
     clientId: 'ding-client',
     clientSecret: 'host-secret',
-    approvedSenders: [{ staffId: 'staff-approved' }],
     harness: {
       sessionExists: async () => true,
       createSession: async () => 'session-group',
@@ -171,6 +168,79 @@ test('group messages require an explicit bot mention before authorization or Har
   assert.equal(fixture.sessions.get('group:group-one'), 'session-group');
 });
 
+test('bridge streams Harness snapshots into one DingTalk AI Card and finalizes it', async () => {
+  const fixture = stateFixture();
+  const calls = { create: [], update: [], finish: [], text: [] };
+  const bridge = new DingtalkHarnessBridge({
+    api: {
+      sendText: async (request) => calls.text.push(request),
+      createAiCard: async (request) => {
+        calls.create.push(request);
+        return { cardInstanceId: 'card-one' };
+      },
+      updateAiCard: async (request) => calls.update.push(request),
+      finishAiCard: async (request) => {
+        calls.finish.push(request);
+        return { delivered: true, completed: false };
+      },
+    },
+    clientId: 'ding-client',
+    clientSecret: 'host-secret',
+    harness: {
+      sessionExists: async () => false,
+      createSession: async () => 'session-stream',
+      ask: async (_sessionId, _text, options) => {
+        options.onUpdate({ type: 'text', text: '生成中的完整快照' });
+        await new Promise((resolve) => setTimeout(resolve, 510));
+        return '最终完整回答';
+      },
+    },
+    state: fixture.state,
+  });
+
+  await bridge.accept(message('stream', '请流式回答'));
+
+  assert.equal(calls.create.length, 1);
+  assert.deepEqual(calls.create[0].target, { type: 'user', userId: 'staff-approved' });
+  assert.equal(calls.update.at(-1).text, '生成中的完整快照');
+  assert.equal(calls.finish.length, 1);
+  assert.equal(calls.finish[0].text, '最终完整回答');
+  assert.equal(calls.text.length, 0);
+  assert.equal(bridge.status.messagesReplied, 1);
+});
+
+test('bridge asks Harness once and falls back to final text when AI Card creation fails', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  let asks = 0;
+  const bridge = new DingtalkHarnessBridge({
+    api: {
+      sendText: async (request) => sent.push(request.text),
+      createAiCard: async () => { throw new Error('card unavailable'); },
+      updateAiCard: async () => undefined,
+      finishAiCard: async () => undefined,
+    },
+    clientId: 'ding-client',
+    clientSecret: 'host-secret',
+    harness: {
+      sessionExists: async () => false,
+      createSession: async () => 'session-fallback',
+      ask: async () => {
+        asks += 1;
+        return '文本降级回答';
+      },
+    },
+    state: fixture.state,
+    logger: { error() {} },
+  });
+
+  await bridge.accept(message('fallback', '卡片失败也要回答'));
+
+  assert.equal(asks, 1);
+  assert.deepEqual(sent, ['文本降级回答']);
+  assert.equal(bridge.status.messagesReplied, 1);
+});
+
 test('commands stay local and unsafe session webhooks are rejected before Harness', async () => {
   const fixture = stateFixture();
   fixture.sessions.set('p2p:staff-approved', 'old-session');
@@ -180,7 +250,6 @@ test('commands stay local and unsafe session webhooks are rejected before Harnes
     api: { sendText: async (request) => sent.push(request.text) },
     clientId: 'ding-client',
     clientSecret: 'host-secret',
-    approvedSenders: [{ staffId: 'staff-approved' }],
     harness: {
       ensureRunning: async () => true,
       sessionExists: async () => true,

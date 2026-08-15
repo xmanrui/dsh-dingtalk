@@ -33,7 +33,7 @@ npx -y github:xmanrui/dsh-dingtalk install
 3. 使用已加入企业/组织的钉钉账号扫描页面二维码；
 4. 在钉钉授权页点击「一键创建新机器人」；
 5. 等待页面自动显示机器人已连接；
-6. 在钉钉里私聊机器人，回到本机 Harness 页面批准该使用者，再次发送消息。
+6. 在钉钉里私聊机器人，消息会直接进入 Harness。
 
 钉钉当前把该扫码入口命名为 OpenClaw 注册流程，因此官方授权页可能显示 OpenClaw 品牌。插件只复用钉钉公开的机器人创建授权协议；扫码后的机器人连接、凭据保存、消息处理和会话均由 DeepSeek Harness 管理。
 
@@ -41,16 +41,17 @@ npx -y github:xmanrui/dsh-dingtalk install
 
 可以重复扫码添加多个钉钉机器人。每个机器人拥有独立凭据引用、Stream 连接、消息去重记录和 Harness 会话映射；一个机器人重连或移除不会影响其他机器人。
 
-### 为什么首次消息还要在本机批准
+### 访问范围
 
-钉钉扫码结果只返回机器人 `client_id` 和 `client_secret`，不会返回扫码人的 staff ID。插件不能安全地假定第一位发消息的人就是管理员。未批准使用者的消息只会收到固定提示，不会进入 Harness；本机设置页批准后，该使用者才能驱动 Harness。请同时在钉钉开放平台限制机器人的可见范围。
+插件不再要求 Harness 本机二次批准发送者。能在钉钉中向机器人发送消息的使用者，其文字消息会直接进入 Harness。请在钉钉开放平台中把机器人可见范围限制为信任的组织、群或成员；该可见范围就是本插件的入站访问控制范围。
 
 ### 消息行为
 
-- 支持钉钉私聊文字消息；群聊仅处理已批准使用者明确 @ 机器人的文字；
+- 支持钉钉私聊文字消息；群聊仅处理明确 @ 机器人的文字；
 - 每个会话映射到持久 Harness 会话，支持连续对话；
 - `/new` 开启新会话，`/status` 检查连接，`/help` 显示帮助；
-- Harness 回答较长时会拆成多条钉钉文本；
+- Harness 回答通过同一张钉钉 AI Card 持续更新，生成结束后在原卡片中显示完整答案；
+- AI Card 创建、更新或完成失败时自动降级为普通钉钉文本，不会重新执行 Harness 请求；
 - 当前不把图片、文件、视频或语音送入 Harness。
 
 ### 安全设计
@@ -58,6 +59,7 @@ npx -y github:xmanrui/dsh-dingtalk install
 - 浏览器永远不会收到或提交 `client_secret`、`device_code`、凭据引用或原始 staff ID；
 - Host RPC 仅允许 Harness loopback 页面调用；
 - `client_secret` 只保存在 `ctx.credentials`，非敏感配置位于 `$DSH_HOME/integrations/dsh-dingtalk/config.json`；
+- 入站访问权由钉钉机器人的可见范围决定，插件不在 Harness 本机重复建立发送者白名单；
 - 入站消息先向钉钉确认接收，再排队交给 Harness，避免长任务触发重复投递；
 - 会话 Webhook 只在内存中使用，必须是钉钉 HTTPS 域名，不写入配置或日志；
 - 删除机器人会停止它自己的 Stream 连接，并删除自己的凭据、配置、去重记录和会话映射。
@@ -78,7 +80,7 @@ node bin/dsh-dingtalk.mjs install --source .
 npm run verify:protocol
 ```
 
-完整人工验收需要在 Harness 设置页完成一次手机扫码，在钉钉中发送测试消息、在本机批准使用者，再确认 Harness 回答返回钉钉。
+完整人工验收需要在 Harness 设置页完成一次手机扫码，然后在钉钉中发送测试消息，确认 Harness 回答返回钉钉。
 
 ### 协议来源与许可
 
@@ -106,6 +108,6 @@ The scanning DingTalk account must already belong to an enterprise or organizati
 
 Restart `dsh web`, open **Settings → Plugins → IM Bot → DingTalk**, generate the QR code, scan it with the DingTalk app, and select **Create a new bot** on the authorization page. The DingTalk-hosted page may currently display OpenClaw branding because DingTalk exposes this registration flow under that name; the resulting bot is connected to DeepSeek Harness by this plugin.
 
-DingTalk does not return the scanning user's staff ID. After the Stream connection is ready, send the bot a direct message and approve that sender locally in Harness. Unapproved messages never enter Harness. Limit the bot's visibility in the DingTalk developer console as an additional safeguard.
+DingTalk visibility is the inbound access-control scope. Any user who can message the bot can send text directly into Harness; there is no second sender-approval step on the Harness host. Restrict the bot's visibility to trusted organizations, groups, or members in the DingTalk developer console.
 
-The plugin supports approved direct-message text and group text that explicitly mentions the bot. It keeps credentials, Stream connections, deduplication, and Harness sessions isolated per bot. See the Chinese section for the complete security model and verification commands.
+The plugin supports direct-message text and group text that explicitly mentions the bot. Harness replies update one DingTalk AI Card while generation is in progress and finalize that same card with the complete answer. If card delivery fails, the plugin falls back to ordinary DingTalk text without running the Harness request again. It keeps credentials, Stream connections, deduplication, and Harness sessions isolated per bot. See the Chinese section for the complete security model and verification commands.

@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto';
+
 export const DINGTALK_REGISTRATION_BASE_URL = 'https://oapi.dingtalk.com/';
 export const DINGTALK_API_BASE_URL = 'https://api.dingtalk.com/';
 export const DINGTALK_REGISTRATION_SOURCE = 'DING_DWS_CLAW';
+export const DINGTALK_AI_CARD_TEMPLATE_ID = '02fcf2f4-5e02-4a85-b672-46d1f715543e.schema';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const REGISTRATION_STATUSES = new Set(['WAITING', 'SUCCESS', 'FAIL', 'EXPIRED']);
@@ -74,11 +77,31 @@ function abortError(signal) {
   return new DOMException('The operation was aborted', 'AbortError');
 }
 
+function abortableDelay(ms, signal) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError(signal));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 async function requestJson(fetchImpl, url, {
   body,
   signal,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   headers = {},
+  method = 'POST',
   action = 'request',
 } = {}) {
   const controller = new AbortController();
@@ -93,7 +116,7 @@ async function requestJson(fetchImpl, url, {
 
   try {
     const response = await fetchImpl(url, {
-      method: 'POST',
+      method,
       redirect: 'error',
       headers: { 'content-type': 'application/json', ...headers },
       body: JSON.stringify(body ?? {}),
@@ -122,6 +145,65 @@ async function requestJson(fetchImpl, url, {
   }
 }
 
+function normalizeCardTarget(target) {
+  if (target?.type === 'user') {
+    const userId = nonEmptyString(target.userId);
+    if (userId) return { type: 'user', userId };
+  }
+  if (target?.type === 'group') {
+    const openConversationId = nonEmptyString(target.openConversationId);
+    if (openConversationId) return { type: 'group', openConversationId };
+  }
+  throw new TypeError('DingTalk AI Card target is invalid');
+}
+
+function cardData(text, flowStatus) {
+  return {
+    cardParamMap: {
+      flowStatus,
+      msgContent: normalizeDingtalkCardMarkdown(text),
+      staticMsgContent: '',
+      sys_full_json_obj: JSON.stringify({ order: ['msgContent'] }),
+      config: JSON.stringify({ autoLayout: true }),
+    },
+  };
+}
+
+function cardDeliverBody(cardInstanceId, target, robotCode) {
+  const base = { outTrackId: cardInstanceId, userIdType: 1 };
+  if (target.type === 'group') {
+    return {
+      ...base,
+      openSpaceId: `dtv1.card//IM_GROUP.${target.openConversationId}`,
+      imGroupOpenDeliverModel: { robotCode },
+    };
+  }
+  return {
+    ...base,
+    openSpaceId: `dtv1.card//IM_ROBOT.${target.userId}`,
+    imRobotOpenDeliverModel: {
+      spaceType: 'IM_ROBOT',
+      robotCode,
+      extension: { dynamicSummary: 'true' },
+    },
+  };
+}
+
+export function normalizeDingtalkCardMarkdown(value) {
+  const text = typeof value === 'string' ? value.replace(/\r\n?/g, '\n') : '';
+  const lines = text.split('\n');
+  let inCodeBlock = false;
+  return lines.map((line, index) => {
+    const fenced = /^\s{0,3}```/.test(line);
+    const currentInCodeBlock = inCodeBlock;
+    if (fenced) inCodeBlock = !inCodeBlock;
+    if (index === lines.length - 1) return line;
+    if (currentInCodeBlock || fenced || inCodeBlock || !line || !lines[index + 1]) return `${line}\n`;
+    if (/^\s{0,3}(?:[-*+] |\d+[.)] |#{1,6} |\||> )/.test(lines[index + 1])) return `${line}\n`;
+    return `${line}<br>`;
+  }).join('');
+}
+
 function assertRegistrationOk(value, action) {
   if (!value || typeof value !== 'object' || value.errcode !== 0) {
     throw new DingtalkApiError(
@@ -144,9 +226,19 @@ export function createDingtalkApi({
   registrationSource = process.env.DINGTALK_REGISTRATION_SOURCE
     || DINGTALK_REGISTRATION_SOURCE,
   now = () => Date.now(),
+  cardMinIntervalMs = 50,
+  cardBackoffMs = 1_000,
+  delay = abortableDelay,
 } = {}) {
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
   if (typeof now !== 'function') throw new TypeError('now must be a function');
+  if (!Number.isFinite(cardMinIntervalMs) || cardMinIntervalMs < 0) {
+    throw new TypeError('cardMinIntervalMs must be a non-negative number');
+  }
+  if (!Number.isFinite(cardBackoffMs) || cardBackoffMs < 0) {
+    throw new TypeError('cardBackoffMs must be a non-negative number');
+  }
+  if (typeof delay !== 'function') throw new TypeError('delay must be a function');
   const registrationBase = normalizeTrustedUrl(registrationBaseUrl, {
     label: '钉钉注册服务',
     requireSubdomain: false,
@@ -156,6 +248,8 @@ export function createDingtalkApi({
   if (!source) throw new TypeError('registrationSource is required');
   const tokenCache = new Map();
   const tokenRequests = new Map();
+  let cardSlotTail = Promise.resolve();
+  let nextCardRequestAt = 0;
 
   const endpoint = (base, pathname) => new URL(pathname.replace(/^\//, ''), base);
 
@@ -182,6 +276,69 @@ export function createDingtalkApi({
     })().finally(() => tokenRequests.delete(appKey));
     tokenRequests.set(appKey, request);
     return request;
+  }
+
+  function acquireCardRequestSlot(signal) {
+    const acquire = async () => {
+      const waitMs = Math.max(0, nextCardRequestAt - now());
+      if (waitMs > 0) await delay(waitMs, signal);
+      nextCardRequestAt = Math.max(nextCardRequestAt, now()) + cardMinIntervalMs;
+    };
+    const slot = cardSlotTail.then(acquire, acquire);
+    cardSlotTail = slot.catch(() => undefined);
+    return slot;
+  }
+
+  async function cardRequest(pathname, options) {
+    await acquireCardRequestSlot(options.signal);
+    try {
+      return await requestJson(fetchImpl, endpoint(apiBase, pathname), options);
+    } catch (error) {
+      if (!(error instanceof DingtalkApiError) || error.status !== 403) throw error;
+      await delay(cardBackoffMs, options.signal);
+      await acquireCardRequestSlot(options.signal);
+      return requestJson(fetchImpl, endpoint(apiBase, pathname), options);
+    }
+  }
+
+  async function failCard({ clientId, clientSecret, cardInstanceId, text, signal }) {
+    const instanceId = nonEmptyString(cardInstanceId);
+    const content = nonEmptyString(text);
+    if (!instanceId) throw new TypeError('cardInstanceId is required');
+    if (!content) throw new TypeError('text is required');
+    const token = await accessToken({ clientId, clientSecret, signal });
+    const headers = { 'x-acs-dingtalk-access-token': token };
+    const requests = [
+      cardRequest('v1.0/card/streaming', {
+        method: 'PUT',
+        body: {
+          outTrackId: instanceId,
+          guid: randomUUID(),
+          key: 'msgContent',
+          content: normalizeDingtalkCardMarkdown(content),
+          isFull: true,
+          isFinalize: false,
+          isError: true,
+        },
+        headers,
+        signal,
+        action: 'AI Card 失败收口',
+      }),
+      cardRequest('v1.0/card/instances', {
+        method: 'PUT',
+        body: {
+          outTrackId: instanceId,
+          cardData: cardData(content, '5'),
+          cardUpdateOptions: { updateCardDataByKey: true },
+        },
+        headers,
+        signal,
+        action: 'AI Card 失败状态',
+      }),
+    ];
+    const results = await Promise.allSettled(requests);
+    if (results.every(({ status }) => status === 'rejected')) throw results[0].reason;
+    return true;
   }
 
   return Object.freeze({
@@ -245,6 +402,152 @@ export function createDingtalkApi({
     },
 
     accessToken,
+
+    async createAiCard({ clientId, clientSecret, target, initialText, signal }) {
+      const appKey = nonEmptyString(clientId);
+      const appSecret = nonEmptyString(clientSecret);
+      const content = nonEmptyString(initialText);
+      if (!appKey || !appSecret) throw new TypeError('clientId and clientSecret are required');
+      if (!content) throw new TypeError('initialText is required');
+      const normalizedTarget = normalizeCardTarget(target);
+      const token = await accessToken({ clientId: appKey, clientSecret: appSecret, signal });
+      const cardInstanceId = `dsh_${randomUUID()}`;
+      const headers = { 'x-acs-dingtalk-access-token': token };
+
+      let delivered = false;
+      try {
+        await cardRequest('v1.0/card/instances', {
+          body: {
+            cardTemplateId: DINGTALK_AI_CARD_TEMPLATE_ID,
+            outTrackId: cardInstanceId,
+            cardData: {
+              cardParamMap: { config: JSON.stringify({ autoLayout: true }) },
+            },
+            callbackType: 'STREAM',
+            imGroupOpenSpaceModel: { supportForward: true },
+            imRobotOpenSpaceModel: { supportForward: true },
+          },
+          headers,
+          signal,
+          action: 'AI Card 创建',
+        });
+        await cardRequest('v1.0/card/instances/deliver', {
+          body: cardDeliverBody(cardInstanceId, normalizedTarget, appKey),
+          headers,
+          signal,
+          action: 'AI Card 投放',
+        });
+        delivered = true;
+        await cardRequest('v1.0/card/instances', {
+          method: 'PUT',
+          body: { outTrackId: cardInstanceId, cardData: cardData(content, '2') },
+          headers,
+          signal,
+          action: 'AI Card 启动',
+        });
+        await cardRequest('v1.0/card/streaming', {
+          method: 'PUT',
+          body: {
+            outTrackId: cardInstanceId,
+            guid: randomUUID(),
+            key: 'msgContent',
+            content: normalizeDingtalkCardMarkdown(content).replace(/\n+$/, ''),
+            isFull: true,
+            isFinalize: false,
+            isError: false,
+          },
+          headers,
+          signal,
+          action: 'AI Card 启动',
+        });
+      } catch (error) {
+        if (delivered) {
+          const cleanupSignal = AbortSignal.timeout(5_000);
+          await failCard({
+            clientId: appKey,
+            clientSecret: appSecret,
+            cardInstanceId,
+            text: '消息处理失败，请稍后重试。',
+            signal: cleanupSignal,
+          }).catch(() => undefined);
+        }
+        throw error;
+      }
+      return { cardInstanceId };
+    },
+
+    async updateAiCard({ clientId, clientSecret, cardInstanceId, text, signal }) {
+      const instanceId = nonEmptyString(cardInstanceId);
+      const content = nonEmptyString(text);
+      if (!instanceId) throw new TypeError('cardInstanceId is required');
+      if (!content) throw new TypeError('text is required');
+      const token = await accessToken({ clientId, clientSecret, signal });
+      await cardRequest('v1.0/card/streaming', {
+        method: 'PUT',
+        body: {
+          outTrackId: instanceId,
+          guid: randomUUID(),
+          key: 'msgContent',
+          content: normalizeDingtalkCardMarkdown(content).replace(/\n+$/, ''),
+          isFull: true,
+          isFinalize: false,
+          isError: false,
+        },
+        headers: { 'x-acs-dingtalk-access-token': token },
+        signal,
+        action: 'AI Card 更新',
+      });
+      return true;
+    },
+
+    async finishAiCard({ clientId, clientSecret, cardInstanceId, text, signal }) {
+      const instanceId = nonEmptyString(cardInstanceId);
+      const content = nonEmptyString(text);
+      if (!instanceId) throw new TypeError('cardInstanceId is required');
+      if (!content) throw new TypeError('text is required');
+      const token = await accessToken({ clientId, clientSecret, signal });
+      const headers = { 'x-acs-dingtalk-access-token': token };
+      const normalizedContent = normalizeDingtalkCardMarkdown(content);
+      await cardRequest('v1.0/card/streaming', {
+        method: 'PUT',
+        body: {
+          outTrackId: instanceId,
+          guid: randomUUID(),
+          key: 'msgContent',
+          content: normalizedContent,
+          isFull: true,
+          isFinalize: true,
+          isError: false,
+        },
+        headers,
+        signal,
+        action: 'AI Card 完成',
+      });
+      let completed = true;
+      const completionRequest = {
+        method: 'PUT',
+        body: {
+          outTrackId: instanceId,
+          cardData: cardData(content, '3'),
+          cardUpdateOptions: { updateCardDataByKey: true },
+        },
+        headers,
+        signal,
+        action: 'AI Card 收口',
+      };
+      try {
+        await cardRequest('v1.0/card/instances', completionRequest);
+      } catch {
+        try {
+          await cardRequest('v1.0/card/instances', completionRequest);
+        } catch {
+          completed = false;
+        }
+      }
+      return { delivered: true, completed };
+    },
+
+    failAiCard: failCard,
 
     async sendText({ clientId, clientSecret, sessionWebhook, text, signal }) {
       const content = nonEmptyString(text);

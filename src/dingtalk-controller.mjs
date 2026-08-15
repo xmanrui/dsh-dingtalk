@@ -537,7 +537,7 @@ export class DingtalkController {
         record.state = 'failed';
         record.error = safeError(
           'activation-failed',
-          '钉钉已授权，但无法安全保存凭据或启动消息连接。',
+          '钉钉已授权，但无法安全保存接入配置。',
         );
         if (this.#activeAttemptId === record.id) this.#activeAttemptId = null;
         this.#logger.error?.('[dsh-dingtalk] bot activation failed');
@@ -562,16 +562,7 @@ export class DingtalkController {
       approvedSenders: previousConfig?.approvedSenders ?? [],
     };
     return this.#withBotTransition(identity.botId, async () => {
-      await this.#credentials.set(identity.secretRef, clientSecret);
-      try {
-        this.#assertAttemptActive(record);
-        await this.#configStore.save(config);
-        this.#assertAttemptActive(record);
-        await this.#startRuntime(config, clientSecret);
-        this.#assertAttemptActive(record);
-        this.#errors.delete(identity.botId);
-        return { botId: identity.botId, alreadyConnected: Boolean(previousConfig) };
-      } catch (error) {
+      const rollback = async () => {
         await this.#stopRuntime(identity.botId);
         if (previousConfig) await this.#configStore.save(previousConfig).catch(() => undefined);
         else if (this.#configStore.get(identity.botId)) {
@@ -581,8 +572,32 @@ export class DingtalkController {
         if (previousConfig && cleanString(previousSecret?.value)) {
           await this.#startRuntime(previousConfig, previousSecret.value).catch(() => undefined);
         }
+      };
+      await this.#credentials.set(identity.secretRef, clientSecret);
+      try {
+        this.#assertAttemptActive(record);
+        await this.#configStore.save(config);
+        this.#assertAttemptActive(record);
+      } catch (error) {
+        await rollback();
         throw error;
       }
+      try {
+        await this.#startRuntime(config, clientSecret);
+        this.#assertAttemptActive(record);
+        this.#errors.delete(identity.botId);
+      } catch (error) {
+        if (record.controller.signal.aborted || this.#activeAttemptId !== record.id) {
+          await rollback();
+          throw abortError();
+        }
+        this.#errors.set(
+          identity.botId,
+          safeError('connection-failed', '钉钉已接入，但消息连接暂未就绪，请稍后重试。'),
+        );
+        this.#logger.warn?.('[dsh-dingtalk] authorized bot saved but its connection is not ready');
+      }
+      return { botId: identity.botId, alreadyConnected: Boolean(previousConfig) };
     });
   }
 

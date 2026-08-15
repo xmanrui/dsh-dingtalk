@@ -21,8 +21,6 @@ test('client exposes the fixed DingTalk RPC channel and endpoint names', () => {
     cancelProvisioning: 'provision.cancel',
     reconnectBot: 'bot.reconnect',
     deleteBot: 'bot.delete',
-    approveSender: 'bot.sender.approve',
-    revokeSender: 'bot.sender.revoke',
   });
 });
 
@@ -78,7 +76,7 @@ test('provisioning keeps only the browser-safe attempt projection', () => {
   assert.doesNotMatch(JSON.stringify(value), /raw-device|raw-client|credential-ref/);
 });
 
-test('snapshot derives totals and exposes only masked bot and sender identities', () => {
+test('snapshot derives totals and exposes only browser-safe bot state', () => {
   const snapshot = normalizeSnapshot({
     schemaVersion: 1,
     revision: 7,
@@ -97,31 +95,16 @@ test('snapshot derives totals and exposes only masked bot and sender identities'
       deviceCode: 'device-code',
       health: { status: 'healthy', summary: '连接正常', lastCheckedAt: 123 },
       stats: { messagesReceived: 8, messagesReplied: 6 },
-      senders: {
-        pending: [{
-          requestId: 'request-safe',
-          displayName: '小林',
-          senderIdMasked: 'staff••91',
-          senderId: 'raw-staff-id',
-          conversationType: '2',
-        }],
-        approved: [{
-          senderKey: 'sender-key-safe',
-          displayName: '小周',
-          senderIdMasked: 'staff••23',
-          senderId: 'another-raw-id',
-        }],
-      },
+      senders: { pending: [{ senderId: 'raw-staff-id' }] },
     }],
   });
 
-  assert.deepEqual(snapshot.totals, { configured: 1, connected: 1, pendingApproval: 1 });
+  assert.deepEqual(snapshot.totals, { configured: 1, connected: 1 });
   assert.equal(snapshot.bots[0].state, 'connected');
-  assert.equal(snapshot.bots[0].senders.pending[0].conversationType, 'group');
-  assert.equal(snapshot.bots[0].senders.approved[0].senderKey, 'sender-key-safe');
+  assert.equal('senders' in snapshot.bots[0], false);
   assert.doesNotMatch(
     JSON.stringify(snapshot),
-    /raw-client-id|raw-client-secret|credential-ref|device-code|raw-staff-id|another-raw-id/,
+    /raw-client-id|raw-client-secret|credential-ref|device-code|raw-staff-id/,
   );
 });
 
