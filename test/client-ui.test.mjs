@@ -49,3 +49,17 @@ test('the client uses an isolated compact and accessible DingTalk style namespac
   assert.match(source, /aria-live': 'polite'/);
   assert.match(source, /role: 'alertdialog'/);
 });
+
+test('the QR card responds to its plugin panel width instead of the browser viewport', async () => {
+  const styles = await readFile(STYLES_URL, 'utf8');
+  assert.match(styles, /container-type: inline-size/);
+  assert.match(
+    styles,
+    /@container \(max-width: 680px\)[\s\S]*\.ddt-qrLayout \{ grid-template-columns: minmax\(0, 1fr\); justify-items: center;/,
+  );
+  assert.match(styles, /\.ddt-qrFrame \{[^\n]*width: min\(270px, 100%\)/);
+  assert.match(styles, /\.ddt-countdown \{ width: min\(270px, 100%\)/);
+  assert.match(styles, /\.ddt-qrLayout \{[^\n]*align-items: start;/);
+  assert.match(styles, /\.ddt-qrColumn \{ width: 100%; min-width: 0; \}/);
+  assert.match(styles, /\.ddt-qrCopy \{ min-width: 0; overflow-wrap: anywhere; \}/);
+});

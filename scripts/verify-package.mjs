@@ -23,6 +23,10 @@ if (!client.includes('id: "@xmanrui/dsh-dingtalk"')) {
 }
 if (!host.includes('dsh-dingtalk-host')) throw new Error('host bundle does not contain the plugin entry');
 if (!host.includes('dingtalk-stream')) throw new Error('host bundle does not use the official DingTalk Stream SDK');
+if (!client.includes('container-type: inline-size')
+  || !client.includes('@container (max-width: 680px)')) {
+  throw new Error('client bundle does not contain the narrow-panel QR layout');
+}
 if (!patch.includes("name: '@xmanrui/dsh-dingtalk'")) {
   throw new Error('bundle patch does not activate the package');
 }
