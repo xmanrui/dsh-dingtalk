@@ -18,7 +18,8 @@ test('standalone client exports a reusable settings component and registration',
 
 test('QR guidance describes the complete official DingTalk authorization flow', async () => {
   const source = await readFile(CLIENT_URL, 'utf8');
-  assert.match(source, /打开钉钉 App，扫描左侧二维码/);
+  assert.match(source, /使用已加入企业\/组织的钉钉账号扫描左侧二维码/);
+  assert.match(source, /如果钉钉提示尚未加入组织/);
   assert.match(source, /在授权页点击“一键创建新机器人”/);
   assert.match(source, /保持本页打开，等待机器人自动连接/);
   assert.match(source, /官方授权页目前可能显示 OpenClaw 品牌/);

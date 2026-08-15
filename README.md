@@ -9,7 +9,7 @@
 ### 前提条件
 
 - DeepSeek Harness `0.1.0-rc.6`，Node.js `>=22.19`；
-- 手机安装钉钉 App，扫码账号有权创建机器人；
+- 手机安装钉钉 App，扫码账号已加入一个企业/组织并有权创建机器人；
 - 运行 Harness 的设备能够访问 `*.dingtalk.com`。
 
 ### 安装与扫码接入
@@ -30,12 +30,14 @@ npx -y github:xmanrui/dsh-dingtalk install
 
 1. 打开「设置 → 插件 → IM机器人 → 钉钉」；
 2. 点击「扫码接入钉钉」；
-3. 使用手机钉钉扫描页面二维码；
+3. 使用已加入企业/组织的钉钉账号扫描页面二维码；
 4. 在钉钉授权页点击「一键创建新机器人」；
 5. 等待页面自动显示机器人已连接；
 6. 在钉钉里私聊机器人，回到本机 Harness 页面批准该使用者，再次发送消息。
 
 钉钉当前把该扫码入口命名为 OpenClaw 注册流程，因此官方授权页可能显示 OpenClaw 品牌。插件只复用钉钉公开的机器人创建授权协议；扫码后的机器人连接、凭据保存、消息处理和会话均由 DeepSeek Harness 管理。
+
+若扫码后提示“该账号还未加入组织”，可在钉钉提示页创建企业/组织/团队，或重新登录并换用已加入组织的账号，然后返回 Harness 重新扫码。
 
 可以重复扫码添加多个钉钉机器人。每个机器人拥有独立凭据引用、Stream 连接、消息去重记录和 Harness 会话映射；一个机器人重连或移除不会影响其他机器人。
 
@@ -99,6 +101,8 @@ Or install only this channel:
 ```bash
 npx -y github:xmanrui/dsh-dingtalk install
 ```
+
+The scanning DingTalk account must already belong to an enterprise or organization and have permission to create a bot. If DingTalk reports that the account has not joined an organization, create one from that prompt or sign in with an account that already belongs to one, then scan again.
 
 Restart `dsh web`, open **Settings → Plugins → IM Bot → DingTalk**, generate the QR code, scan it with the DingTalk app, and select **Create a new bot** on the authorization page. The DingTalk-hosted page may currently display OpenClaw branding because DingTalk exposes this registration flow under that name; the resulting bot is connected to DeepSeek Harness by this plugin.
 
