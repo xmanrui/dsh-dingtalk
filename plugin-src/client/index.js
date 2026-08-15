@@ -327,12 +327,51 @@ export function DingtalkSettingsTab({ rpcCall }) {
   const [notice, setNotice] = React.useState('');
   const [now, setNow] = React.useState(() => Date.now());
   const addButtonRef = React.useRef(null);
+  const mountedRef = React.useRef(true);
+  const statusRequestRef = React.useRef(0);
+  const noticeFrameRef = React.useRef(null);
+  const focusFrameRef = React.useRef(null);
+
+  React.useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      statusRequestRef.current += 1;
+      if (noticeFrameRef.current !== null) {
+        window.cancelAnimationFrame(noticeFrameRef.current);
+        noticeFrameRef.current = null;
+      }
+      if (focusFrameRef.current !== null) {
+        window.cancelAnimationFrame(focusFrameRef.current);
+        focusFrameRef.current = null;
+      }
+    };
+  }, []);
 
   React.useEffect(() => installDingtalkStyles(), []);
 
   const announce = React.useCallback((message) => {
+    if (!mountedRef.current) return;
+    if (noticeFrameRef.current !== null) {
+      window.cancelAnimationFrame(noticeFrameRef.current);
+      noticeFrameRef.current = null;
+    }
     setNotice('');
-    if (message) window.requestAnimationFrame(() => setNotice(message));
+    if (message) {
+      noticeFrameRef.current = window.requestAnimationFrame(() => {
+        noticeFrameRef.current = null;
+        if (mountedRef.current) setNotice(message);
+      });
+    }
+  }, []);
+
+  const focusAddButton = React.useCallback(() => {
+    if (!mountedRef.current) return;
+    if (focusFrameRef.current !== null) window.cancelAnimationFrame(focusFrameRef.current);
+    focusFrameRef.current = window.requestAnimationFrame(() => {
+      focusFrameRef.current = null;
+      if (mountedRef.current) addButtonRef.current?.focus();
+    });
   }, []);
 
   const invoke = React.useCallback(async (endpoint, payload = {}, signal) => {
@@ -340,10 +379,23 @@ export function DingtalkSettingsTab({ rpcCall }) {
     return unwrapRpcResult(await rpcCall(endpoint, payload, signal));
   }, [rpcCall]);
 
-  const loadStatus = React.useCallback(async ({ signal, silent = false } = {}) => {
-    if (!silent) setModel((current) => ({ ...current, phase: 'loading', error: null }));
+  const loadStatus = React.useCallback(async ({
+    signal,
+    silent = false,
+    restoreProvisioning = false,
+  } = {}) => {
+    if (!mountedRef.current || signal?.aborted) return undefined;
+    const requestId = statusRequestRef.current + 1;
+    statusRequestRef.current = requestId;
+    const canCommit = () => mountedRef.current
+      && !signal?.aborted
+      && statusRequestRef.current === requestId;
+    if (!silent && canCommit()) {
+      setModel((current) => ({ ...current, phase: 'loading', error: null }));
+    }
     try {
       const snapshot = normalizeSnapshot(await invoke(DINGTALK_ENDPOINTS.status, {}, signal));
+      if (!canCommit()) return undefined;
       setModel({
         phase: 'ready',
         bots: snapshot.bots,
@@ -351,7 +403,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
         revision: snapshot.revision,
         error: null,
       });
-      if (snapshot.provisioning) {
+      if (restoreProvisioning && snapshot.provisioning) {
         setProvision((current) => !current || current.attemptId === snapshot.provisioning.attemptId
           ? {
               ...current,
@@ -363,7 +415,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
       }
       return snapshot;
     } catch (error) {
-      if (error?.name === 'AbortError') return undefined;
+      if (error?.name === 'AbortError' || !canCommit()) return undefined;
       setModel((current) => ({
         ...current,
         phase: silent && current.phase === 'ready' ? 'ready' : 'error',
@@ -375,7 +427,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
 
   React.useEffect(() => {
     const controller = new AbortController();
-    void loadStatus({ signal: controller.signal });
+    void loadStatus({ signal: controller.signal, restoreProvisioning: true });
     return () => controller.abort();
   }, [loadStatus]);
 
@@ -384,9 +436,13 @@ export function DingtalkSettingsTab({ rpcCall }) {
     const controller = new AbortController();
     let running = false;
     const timer = window.setInterval(async () => {
-      if (running) return;
+      if (running || controller.signal.aborted || !mountedRef.current) return;
       running = true;
-      await loadStatus({ signal: controller.signal, silent: true });
+      await loadStatus({
+        signal: controller.signal,
+        silent: true,
+        restoreProvisioning: false,
+      });
       running = false;
     }, 15_000);
     return () => {
@@ -397,23 +453,28 @@ export function DingtalkSettingsTab({ rpcCall }) {
 
   React.useEffect(() => {
     if (!provision || !ACTIVE_PROVISION_STATES.has(provision.status)) return undefined;
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    const timer = window.setInterval(() => {
+      if (mountedRef.current) setNow(Date.now());
+    }, 1_000);
     return () => window.clearInterval(timer);
   }, [provision?.attemptId, provision?.status]);
 
   const startProvisioning = React.useCallback(async ({ replace = false } = {}) => {
+    if (!mountedRef.current) return;
     setBusy(true);
     try {
       if (replace && provision?.attemptId) {
         await invoke(DINGTALK_ENDPOINTS.cancelProvisioning, {
           attemptId: provision.attemptId,
         });
+        if (!mountedRef.current) return;
       }
       setProvision({ status: 'starting' });
       const started = normalizeProvisioning(await invoke(
         DINGTALK_ENDPOINTS.beginProvisioning,
         { locale: 'zh-CN' },
       ));
+      if (!mountedRef.current) return;
       if (!started.qrCodeDataUrl) {
         throw new Error('钉钉扫码服务没有返回安全的二维码');
       }
@@ -424,46 +485,67 @@ export function DingtalkSettingsTab({ rpcCall }) {
       });
       announce('钉钉二维码已生成，请使用钉钉 App 扫描。');
     } catch (error) {
+      if (!mountedRef.current) return;
       setProvision({
         attemptId: provision?.attemptId,
         status: 'failed',
         error: presentError(error),
       });
     } finally {
-      setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   }, [announce, invoke, provision?.attemptId]);
 
   const cancelProvisioning = React.useCallback(async () => {
+    if (!mountedRef.current) return;
     setBusy(true);
     try {
       if (provision?.attemptId && !['failed', 'expired', 'cancelled'].includes(provision.status)) {
         await invoke(DINGTALK_ENDPOINTS.cancelProvisioning, { attemptId: provision.attemptId });
+        if (!mountedRef.current) return;
       }
       setProvision(null);
       announce('已取消钉钉机器人接入。');
-      window.requestAnimationFrame(() => addButtonRef.current?.focus());
+      focusAddButton();
     } catch (error) {
+      if (!mountedRef.current) return;
       setProvision((current) => ({ ...current, status: 'failed', error: presentError(error) }));
     } finally {
-      setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
-  }, [announce, invoke, provision?.attemptId, provision?.status]);
+  }, [announce, focusAddButton, invoke, provision?.attemptId, provision?.status]);
 
   React.useEffect(() => {
     const attemptId = provision?.attemptId;
     if (!attemptId || !ACTIVE_PROVISION_STATES.has(provision.status)) return undefined;
     const controller = new AbortController();
-    let timer;
+    let disposed = false;
+    let timer = null;
+    const canCommit = () => !disposed && !controller.signal.aborted && mountedRef.current;
+    const schedule = (delay) => {
+      if (!canCommit()) return;
+      if (timer !== null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = null;
+        if (canCommit()) void poll();
+      }, delay);
+    };
     const poll = async () => {
       try {
-        const result = normalizeProvisioning(await invoke(
+        const response = await invoke(
           DINGTALK_ENDPOINTS.pollProvisioning,
           { attemptId },
           controller.signal,
-        ));
+        );
+        if (!canCommit()) return;
+        const result = normalizeProvisioning(response);
         if (result.status === 'connected') {
-          const snapshot = await loadStatus({ signal: controller.signal, silent: true });
+          const snapshot = await loadStatus({
+            signal: controller.signal,
+            silent: true,
+            restoreProvisioning: false,
+          });
+          if (!canCommit()) return;
           const account = result.botId
             ? snapshot?.bots.find((bot) => bot.botId === result.botId)
             : snapshot?.bots.find((bot) => bot.connected);
@@ -471,7 +553,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
             setProvision((current) => current?.attemptId === attemptId
               ? { ...current, ...result, status: 'connecting' }
               : current);
-            timer = window.setTimeout(poll, result.pollIntervalMs);
+            schedule(result.pollIntervalMs);
             return;
           }
           setProvision(null);
@@ -480,27 +562,31 @@ export function DingtalkSettingsTab({ rpcCall }) {
             : '钉钉机器人已接入，可以开始发送消息。');
           return;
         }
+        if (!canCommit()) return;
         setProvision((current) => current?.attemptId === attemptId
           ? { ...current, ...result, durationMs: current.durationMs }
           : current);
         if (ACTIVE_PROVISION_STATES.has(result.status)) {
-          timer = window.setTimeout(poll, result.pollIntervalMs);
+          schedule(result.pollIntervalMs);
         }
       } catch (error) {
-        if (error?.name === 'AbortError') return;
+        if (error?.name === 'AbortError' || !canCommit()) return;
         setProvision((current) => current?.attemptId === attemptId
           ? { ...current, status: 'failed', error: presentError(error) }
           : current);
       }
     };
-    timer = window.setTimeout(poll, provision.pollIntervalMs ?? 3_000);
+    schedule(provision.pollIntervalMs ?? 3_000);
     return () => {
+      disposed = true;
       controller.abort();
-      window.clearTimeout(timer);
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
     };
   }, [announce, invoke, loadStatus, provision?.attemptId, provision?.pollIntervalMs, provision?.status]);
 
   const setBotBusy = React.useCallback((botId, operation) => {
+    if (!mountedRef.current) return;
     setBusyByBot((current) => {
       const next = { ...current };
       if (operation) next[botId] = operation;
@@ -510,17 +596,21 @@ export function DingtalkSettingsTab({ rpcCall }) {
   }, []);
 
   const runBotAction = React.useCallback(async ({ account, operation, endpoint, payload, success }) => {
+    if (!mountedRef.current) return undefined;
     setBotBusy(account.botId, operation);
     try {
       await invoke(endpoint, payload);
-      const snapshot = await loadStatus({ silent: true });
+      if (!mountedRef.current) return undefined;
+      const snapshot = await loadStatus({ silent: true, restoreProvisioning: false });
+      if (!mountedRef.current) return undefined;
       announce(typeof success === 'function' ? success(snapshot) : success);
       return snapshot;
     } catch (error) {
+      if (!mountedRef.current) return undefined;
       announce(`操作失败：${presentError(error).message}`);
       return undefined;
     } finally {
-      setBotBusy(account.botId, null);
+      if (mountedRef.current) setBotBusy(account.botId, null);
     }
   }, [announce, invoke, loadStatus, setBotBusy]);
 
@@ -542,7 +632,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
       payload: { botId: account.botId, confirm: true },
       success: '钉钉机器人及本机凭据已移除。',
     });
-    if (snapshot) setRemoveTarget(null);
+    if (snapshot && mountedRef.current) setRemoveTarget(null);
   }, [runBotAction]);
 
   const approve = React.useCallback((account, sender) => runBotAction({
