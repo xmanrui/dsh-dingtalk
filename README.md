@@ -1,3 +1,4 @@
+# 本项目不维护了，有刚好的插件dsh-im了，支持微信、飞书、钉钉、QQ、企微、Slack、telegram、discord、WhatsApp：https://github.com/xmanrui/dsh-im
 # dsh-dingtalk
 
 [中文](#中文) · [English](#english)
